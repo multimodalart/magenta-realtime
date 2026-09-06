@@ -60,12 +60,9 @@ class RMSNorm(nn.Module):
         self.scale = nn.Parameter(torch.ones(dim)) if use_scale else None
 
     def forward(self, x):
-        dt = x.dtype
-        v = x.float()
-        v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + self.eps)
-        v = v.to(dt)
+        v = F.rms_norm(x, (x.shape[-1],), None, self.eps)
         if self.scale is not None:
-            v = v * self.scale.to(dt)
+            v = v * self.scale.to(x.dtype)
         return v
 
 
@@ -141,6 +138,31 @@ def dot_product_attention(q, k, v, per_dim_scale, sink_k, sink_v, mask):
     return ctx.transpose(1, 2)  # [b, tq, nh, uph]
 
 
+def _project(x, kernel):
+    """Project x: [b, t, d] with kernel: [d, n, h] -> [b, t, n, h].
+
+    The kernel is contiguous, so reshaping it to [d, n * h] is a free view
+    and a single matmul computes the projection. The equivalent einsum
+    ("btd,dnh->btnh") permutes the kernel into [n, d, h] order, which
+    materializes a contiguous copy of the entire weight tensor on every
+    call.
+    """
+    k = kernel.to(x.dtype)
+    b, t, d = x.shape
+    n, h = k.shape[1], k.shape[2]
+    return torch.matmul(x, k.reshape(d, n * h)).view(b, t, n, h)
+
+
+def _out_project(ctx, kernel):
+    """Merge heads and apply the output projection: [b, t, n, h] with
+    kernel: [d, n, h] -> [b, t, d]. Equivalent to einsum("btnh,dnh->btd")
+    without the per-call weight copy; the transposed view is free and the
+    GEMM handles the layout."""
+    k = kernel.to(ctx.dtype)
+    b, t, n, h = ctx.shape
+    return torch.matmul(ctx.reshape(b, t, n * h), k.reshape(k.shape[0], n * h).t())
+
+
 class AttnProjection(nn.Module):
     """q/k/v/out projections stored as [in, nh, uph] (Linen attention kernels)."""
 
@@ -160,7 +182,7 @@ class AttnProjection(nn.Module):
             self.sink_value_embeddings = None
 
     def project(self, x, kernel):
-        return torch.einsum("btd,dnh->btnh", x, kernel.to(x.dtype))
+        return _project(x, kernel)
 
 
 def banded_causal_mask(tq, tkv, past, future, device):
@@ -196,7 +218,7 @@ class SelfAttention(nn.Module):
         mask = banded_causal_mask(t, t, self.max_past_horizon, 0, x.device)
         ctx = dot_product_attention(q, k, v, a.per_dim_scale,
                                     a.sink_key_embeddings, a.sink_value_embeddings, mask)
-        out = torch.einsum("btnh,dnh->btd", ctx, self.output_projection_kernel.to(ctx.dtype))
+        out = _out_project(ctx, self.output_projection_kernel)
         return self.post_norm(out)
 
     def forward(self, x):
@@ -228,7 +250,7 @@ class SelfAttention(nn.Module):
         # the window for the single newest query -> no mask needed.
         ctx = dot_product_attention(q, kk, vv, a.per_dim_scale,
                                     a.sink_key_embeddings, a.sink_value_embeddings, None)
-        out = torch.einsum("btnh,dnh->btd", ctx, self.output_projection_kernel.to(ctx.dtype))
+        out = _out_project(ctx, self.output_projection_kernel)
         return x + self.post_norm(out)
 
     def step_fn(self, x, k_prev, v_prev):
@@ -241,7 +263,7 @@ class SelfAttention(nn.Module):
         v = torch.cat([v_prev, a.project(h, a.value_projection_kernel)], dim=1)
         ctx = dot_product_attention(q, k, v, a.per_dim_scale,
                                     a.sink_key_embeddings, a.sink_value_embeddings, None)
-        out = torch.einsum("btnh,dnh->btd", ctx, self.output_projection_kernel.to(ctx.dtype))
+        out = _out_project(ctx, self.output_projection_kernel)
         return x + self.post_norm(out), k, v
 
 
@@ -263,21 +285,21 @@ class CrossAttention(nn.Module):
 
     def _kv(self, source):
         a = self.attention
-        k = torch.einsum("btd,dnh->btnh", source, a.key_projection_kernel.to(source.dtype))
-        v = torch.einsum("btd,dnh->btnh", source, a.value_projection_kernel.to(source.dtype))
+        k = _project(source, a.key_projection_kernel)
+        v = _project(source, a.value_projection_kernel)
         return k, v
 
     def _branch(self, x, source):
         h = self.pre_norm(x)
         a = self.attention
-        q = torch.einsum("btd,dnh->btnh", h, a.query_projection_kernel.to(h.dtype))
+        q = _project(h, a.query_projection_kernel)
         k, v = self._kv(source)
         tq, tkv = x.shape[1], source.shape[1]
         # query at decoder time i attends source positions within past horizon, causal.
         mask = banded_causal_mask(tq, tkv, self.max_past_horizon, 0, x.device)
         ctx = dot_product_attention(q, k, v, a.per_dim_scale,
                                     a.sink_key_embeddings, a.sink_value_embeddings, mask)
-        out = torch.einsum("btnh,dnh->btd", ctx, self.output_projection_kernel.to(ctx.dtype))
+        out = _out_project(ctx, self.output_projection_kernel)
         return self.post_norm(out)
 
     def forward(self, x, source):
@@ -287,17 +309,17 @@ class CrossAttention(nn.Module):
         """Functional cross-attention given precomputed source KV [b,T,nh,uph]."""
         h = self.pre_norm(x)
         a = self.attention
-        q = torch.einsum("btd,dnh->btnh", h, a.query_projection_kernel.to(h.dtype))
+        q = _project(h, a.query_projection_kernel)
         ctx = dot_product_attention(q, k, v, a.per_dim_scale,
                                     a.sink_key_embeddings, a.sink_value_embeddings, None)
-        out = torch.einsum("btnh,dnh->btd", ctx, self.output_projection_kernel.to(ctx.dtype))
+        out = _out_project(ctx, self.output_projection_kernel)
         return x + self.post_norm(out)
 
     def step(self, x, source_kv):
         # x: [b,1,d]; source_kv: (k,v) accumulated [b, tkv, nh, uph]
         h = self.pre_norm(x)
         a = self.attention
-        q = torch.einsum("btd,dnh->btnh", h, a.query_projection_kernel.to(h.dtype))
+        q = _project(h, a.query_projection_kernel)
         k, v = source_kv
         tkv = k.shape[1]
         keep = self.max_past_horizon + 1
@@ -306,7 +328,7 @@ class CrossAttention(nn.Module):
             v = v[:, -keep:]
         ctx = dot_product_attention(q, k, v, a.per_dim_scale,
                                     a.sink_key_embeddings, a.sink_value_embeddings, None)
-        out = torch.einsum("btnh,dnh->btd", ctx, self.output_projection_kernel.to(ctx.dtype))
+        out = _out_project(ctx, self.output_projection_kernel)
         return x + self.post_norm(out)
 
 
